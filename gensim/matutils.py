@@ -22,7 +22,6 @@ from scipy.stats import entropy
 import scipy.linalg
 from scipy.linalg.lapack import get_lapack_funcs
 from scipy.linalg.special_matrices import triu
-from scipy.special import psi  # gamma function utils
 
 from six import iteritems, itervalues, string_types
 from six.moves import xrange, zip as izip
@@ -598,16 +597,23 @@ def jaccard_distance(set1, set2):
 
     return 1. - float(len(set1 & set2)) / float(union_cardinality)
 
+try:
 
-def dirichlet_expectation(alpha):
-    """
-    For a vector `theta~Dir(alpha)`, compute `E[log(theta)]`.
-    """
-    if len(alpha.shape) == 1:
-        result = psi(alpha) - psi(np.sum(alpha))
-    else:
-        result = psi(alpha) - psi(np.sum(alpha, 1))[:, np.newaxis]
-    return result.astype(alpha.dtype, copy=False)  # keep the same precision as input
+    from gensim._matutils import dirichlet_expectation
+
+except ImportError:
+
+    from scipy.special import psi   # gamma function utils
+
+    def dirichlet_expectation(alpha):
+        """
+        For a vector `theta~Dir(alpha)`, compute `E[log(theta)]`.
+        """
+        if len(alpha.shape) == 1:
+            result = psi(alpha) - psi(np.sum(alpha))
+        else:
+            result = psi(alpha) - psi(np.sum(alpha, 1))[:, np.newaxis]
+        return result.astype(alpha.dtype, copy=False)  # keep the same precision as input
 
 
 def qr_destroy(la):
