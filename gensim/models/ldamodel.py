@@ -39,6 +39,10 @@ import scipy.sparse
 from six.moves import xrange
 from collections import defaultdict
 
+import concurrent.futures
+import threading
+import array
+
 from gensim import interfaces, utils
 import gensim.matutils as mat
 from gensim.matutils import (
@@ -50,7 +54,6 @@ from gensim.models.callbacks import Callback
 
 try:
     import cupy as cp
-    import cupy.sparse
     cupy_available = True
 except ImportError:
     cupy_available = False
@@ -74,7 +77,7 @@ def update_dir_prior(prior, N, logphat, rho):
     gradf = N * (mat.psi(mat.sum(prior)) - mat.psi(prior) + logphat)
 
     prior_np = mat.asnumpy(prior)
-    # TODO: needs a cuda kernel for polygamma
+    # TODO: needs a cuda kernel for polygamma?
     c = N * polygamma(1, np.sum(prior_np))
     q = -N * polygamma(1, prior_np)
     if mat.is_cupy(prior):
@@ -457,6 +460,48 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         self.state = None
         self.Elogbeta = None
 
+    def _make_sparse_matrix(self, chunk):
+        """Convert chunk of bag-of-words documents into a (sparse) document-term matrix"""
+        #indices = [ ]
+        #data = [ ]
+        #indptr = [ 0 ]
+
+        indices = array.array('i')
+        data = array.array('f')
+        indptr = array.array('i')
+        indptr.append(0)
+
+        for doc in chunk:
+            for word, freq in doc:
+                indices.append(word)
+                data.append(freq)
+            indptr.append(len(indices))
+
+        if self.cuda:
+            data = cp.asarray(data, dtype=self.dtype)
+            indices = cp.asarray(indices, dtype=np.int32)
+            indptr = cp.asarray(indptr, dtype=np.int32)
+            docs = cp.sparse.csr_matrix((data, indices, indptr),
+                                        shape=(len(indptr) - 1, self.num_terms),
+                                        dtype=self.dtype)
+        else:
+            docs = scipy.sparse.csr_matrix((data, indices, indptr),
+                                           shape=(len(indptr) - 1, self.num_terms),
+                                           dtype=self.dtype)
+        return docs
+
+    def _make_matrix(self, chunk):
+        """Convert chunk of bag-of-words documents into a (dense) document-term matrix"""
+        docs = np.zeros((len(chunk), self.num_terms), dtype=self.dtype)
+        for i, d in enumerate(chunk):
+            for j, v in d:
+                docs[i,j] = v
+
+        if self.cuda:
+            docs = cp.asarray(docs)
+
+        return docs
+
     def inference(self, chunk, collect_sstats=False):
         """
         Given a chunk of sparse document vectors, estimate gamma (parameters
@@ -477,87 +522,85 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         """
         try:
             len(chunk)
-        except TypeError:
-            # convert iterators/generators to plain list, so we have len() etc.
+        except ValueError:
             chunk = list(chunk)
 
-        try:
-            data, row_ind, col_ind = zip(*((d, r, c) for r,doc in enumerate(chunk) for c,d in doc))
-        except ValueError:
-            # chunk consists of only empty documents
-            data, row_ind, col_ind = [], [], []
-        docs = scipy.sparse.csr_matrix((data, (row_ind, col_ind)),
-                                       dtype=self.dtype,
-                                       shape=(len(chunk), self.num_terms))
-        if docs.shape[0] > 1:
-            logger.debug("performing inference on a chunk of %i documents", docs.shape[0])
-
-        # Initialize the variational distribution q(theta|gamma) for the chunk
-
-        gamma = self.random_state.gamma(100., 1. / 100., (docs.shape[0], self.num_topics)).astype(self.dtype, copy=False)
         if self.cuda:
-            gamma = cp.asarray(gamma)
+            return self._gpu_inference(chunk, collect_sstats)
+        else:
+            return self._cpu_inference(chunk, collect_sstats)
 
-        Elogtheta = dirichlet_expectation(gamma)
-        expElogtheta = mat.exp(Elogtheta)
-        expElogbeta = self.expElogbeta
-        alpha = self.alpha
+    def _gpu_inference(self, chunk, collect_sstats=False):
+        with mat.prof_range('prepare'):
+            gamma = self.random_state.gamma(100., 1. / 100., (len(chunk), self.num_topics)).astype(self.dtype, copy=False)
+            if self.cuda:
+                gamma = cp.asarray(gamma)
 
-        assert Elogtheta.dtype == self.dtype
+            expElogtheta = mat.exp(dirichlet_expectation(gamma))
+            expElogbeta = self.expElogbeta
+            alpha = self.alpha
+
+            if collect_sstats:
+                sstats = mat.zeros_like(expElogbeta, dtype=self.dtype)
+            else:
+                sstats = None
+
+            # Initialize the variational distribution q(theta|gamma) for the chunk
+
+            # Now, for each document d update that document's gamma and phi
+            # Inference code copied from Hoffman's `onlineldavb.py` (esp. the
+            # Lee&Seung trick which speeds things up by an order of magnitude, compared
+            # to Blei's original LDA-C code, cool!).
+            # The optimal phi_{dwk} is proportional to expElogthetad_k * expElogbetad_w.
+            # phinorm is the normalizer.
+            # TODO treat zeros explicitly, instead of adding epsilon?
+            eps = DTYPE_TO_EPS[self.dtype]
+            phinorm = mat.dot(expElogtheta, expElogbeta)
+            phinorm += eps
+
+            expElogbetaFT = cp.asfortranarray(expElogbeta.T)
+
+        with mat.prof_range('docs'):
+            docs = self._make_sparse_matrix(chunk)
+            if docs.shape[0] > 1:
+                logger.debug("performing inference on a chunk of %i documents", docs.shape[0])
+
+        assert expElogtheta.dtype == self.dtype
         assert expElogtheta.dtype == self.dtype
 
-        if collect_sstats:
-            sstats = mat.zeros_like(expElogbeta, dtype=self.dtype)
-        else:
-            sstats = None
-
-        if self.cuda:
-            docs = cupy.sparse.csr_matrix(docs)
-        docs = docs.toarray()
-
-        # Now, for each document d update that document's gamma and phi
-        # Inference code copied from Hoffman's `onlineldavb.py` (esp. the
-        # Lee&Seung trick which speeds things up by an order of magnitude, compared
-        # to Blei's original LDA-C code, cool!).
-
-        # The optimal phi_{dwk} is proportional to expElogthetad_k * expElogbetad_w.
-        # phinorm is the normalizer.
-        # TODO treat zeros explicitly, instead of adding epsilon?
-        eps = DTYPE_TO_EPS[self.dtype]
-        phinorm = mat.dot(expElogtheta, expElogbeta) + eps
-
         # Iterate between gamma and phi until convergence
-        for k in xrange(self.iterations):
-            lastgamma = gamma
-            # We represent phi implicitly to save memory and time.
-            # Substituting the value of the optimal phi back into
-            # the update for gamma gives this update. Cf. Lee&Seung 2001.
-            gamma = alpha + expElogtheta * mat.dot(docs / phinorm, expElogbeta.T)
-            Elogtheta = dirichlet_expectation(gamma)
-            expElogtheta = mat.exp(Elogtheta)
-            phinorm = mat.dot(expElogtheta, expElogbeta) + eps
-            # If gamma hasn't changed much, we're done.
-            # TODO: use mean_absolute_difference
-            meanchange = mat.mean(mat.abs(gamma - lastgamma), axis=1)
-            if mat.max(meanchange) < self.gamma_threshold:
-                break
+        with mat.prof_range('loop'):
+            for k in xrange(self.iterations):
+                lastgamma = gamma
+                # We represent phi implicitly to save memory and time.
+                # Substituting the value of the optimal phi back into
+                # the update for gamma gives this update. Cf. Lee&Seung 2001.
+
+                #gamma = alpha + expElogtheta * mat.dot(docs / phinorm, expElogbeta.T)
+                gamma = alpha + expElogtheta * cp.cusparse.csrmm(mat.spdiv(docs, phinorm), expElogbetaFT)
+                expElogtheta = mat.exp(dirichlet_expectation(gamma))
+                #phinorm = mat.dot(expElogtheta, expElogbeta) + eps
+                phinorm = mat.dot(expElogtheta, expElogbeta, phinorm)
+                phinorm += eps
 
         if collect_sstats:
             # Contribution of document d to the expected sufficient
             # statistics for the M step.
-            sstats += mat.matmul(expElogtheta.T, docs / phinorm)
-
-        converged = 0
-        if docs.shape[0] > 1:
-            logger.debug("%i/%i documents converged within %i iterations", converged, docs.shape[0], self.iterations)
-
-        if collect_sstats:
+            #sstats += mat.matmul(expElogtheta.T, docs / phinorm)
+            sstats += cp.cusparse.csrmm(mat.spdiv(docs, phinorm),
+                                        cp.asfortranarray(expElogtheta),
+                                        transa=True).T
             # This step finishes computing the sufficient statistics for the
             # M step, so that
             # sstats[k, w] = \sum_d n_{dw} * phi_{dwk}
             # = \sum_d n_{dw} * exp{Elogtheta_{dk} + Elogbeta_{kw}} / phinorm_{dw}.
             sstats *= self.expElogbeta
             assert sstats.dtype == self.dtype
+
+        #meanchange = mat.mean(mat.abs(gamma - lastgamma), axis=1)
+        #converged = sum(meanchange < self.gamma_threshold)
+        #if docs.shape[0] > 1:
+        #    logger.debug("%i/%i documents converged within %i iterations", converged, docs.shape[0], self.iterations)
 
         assert gamma.dtype == self.dtype
         return gamma, sstats
@@ -568,12 +611,16 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         sufficient statistics in `state` (or `self.state` if None).
 
         """
-        if state is None:
-            state = self.state
-        gamma, sstats = self.inference(chunk, collect_sstats=True)
-        state.sstats += sstats
-        state.numdocs += gamma.shape[0]  # avoids calling len(chunk) on a generator
-        assert gamma.dtype == self.dtype
+        with mat.prof_range('estep'):
+            if state is None:
+                state = self.state
+            stream = cp.cuda.stream.Stream()
+            with stream:
+                gamma, sstats = self.inference(chunk, collect_sstats=True)
+                #state.sstats += sstats
+                state.sstats = mat.atomicAdd(state.sstats, sstats)
+            state.numdocs += gamma.shape[0]  # avoids calling len(chunk) on a generator
+            assert gamma.dtype == self.dtype
         return gamma
 
     def update_alpha(self, gammat, rho):
@@ -732,6 +779,9 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             # initialize metrics list to store metric values after every epoch
             self.metrics = defaultdict(list)
 
+        self.lock = threading.Lock()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=15)
+
         for pass_ in xrange(passes):
             if self.dispatcher:
                 logger.info('initializing %s workers', self.numworkers)
@@ -739,6 +789,8 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             else:
                 other = LdaState(self.eta, self.state.sstats.shape, self.dtype, cuda=self.cuda)
             dirty = False
+
+            jobs = [ ]
 
             reallen = 0
             chunks = utils.grouper(corpus, chunksize, as_numpy=chunks_as_numpy, dtype=self.dtype)
@@ -761,10 +813,10 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                         "PROGRESS: pass %i, at document #%i/%i",
                         pass_, chunk_no * chunksize + len(chunk), lencorpus
                     )
-                    gammat = self.do_estep(chunk, other)
-
-                    if self.optimize_alpha:
-                        self.update_alpha(gammat, rho())
+                    #gammat = self.do_estep(chunk, other)
+                    jobs.append(executor.submit(self.do_estep, chunk, other))
+                    #if self.optimize_alpha:
+                    #    self.update_alpha(gammat, rho())
 
                 dirty = True
                 del chunk
@@ -775,9 +827,14 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                         # distributed mode: wait for all workers to finish
                         logger.info("reached the end of input; now waiting for all remaining jobs to finish")
                         other = self.dispatcher.getstate()
+
+                    for job in concurrent.futures.as_completed(jobs):
+                        job.result()
+                    cp.cuda.Stream.null.synchronize()
+
                     self.do_mstep(rho(), other, pass_ > 0)
                     del other  # frees up memory
-
+                    jobs = [ ]
                     if self.dispatcher:
                         logger.info('initializing workers')
                         self.dispatcher.reset(self.state)
@@ -801,6 +858,10 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                     # distributed mode: wait for all workers to finish
                     logger.info("reached the end of input; now waiting for all remaining jobs to finish")
                     other = self.dispatcher.getstate()
+                concurrent.futures.wait(jobs)
+                cp.cuda.Stream.null.synchronize()
+
+
                 self.do_mstep(rho(), other, pass_ > 0)
                 del other
                 dirty = False
@@ -814,23 +875,24 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
 
         """
         logger.debug("updating topics")
-        # update self with the new blend; also keep track of how much did
-        # the topics change through this update, to assess convergence
-        diff = mat.log(self.expElogbeta)
-        self.state.blend(rho, other)
-        diff -= self.state.get_Elogbeta()
-        self.sync_state()
+        with mat.prof_range('mstep'):
+            # update self with the new blend; also keep track of how much did
+            # the topics change through this update, to assess convergence
+            diff = mat.log(self.expElogbeta)
+            self.state.blend(rho, other)
+            diff -= self.state.get_Elogbeta()
+            self.sync_state()
 
-        # print out some debug info at the end of each EM iteration
-        self.print_topics(5)
-        logger.info("topic diff=%f, rho=%f", mat.mean(mat.abs(diff)), rho)
+            # print out some debug info at the end of each EM iteration
+            self.print_topics(5)
+            logger.info("topic diff=%f, rho=%f", mat.mean(mat.abs(diff)), rho)
 
-        if self.optimize_eta:
-            self.update_eta(self.state.get_lambda(), rho)
+            if self.optimize_eta:
+                self.update_eta(self.state.get_lambda(), rho)
 
-        if not extra_pass:
-            # only update if this isn't an additional pass
-            self.num_updates += other.numdocs
+            if not extra_pass:
+                # only update if this isn't an additional pass
+                self.num_updates += other.numdocs
 
     def bound(self, corpus, gamma=None, subsample_ratio=1.0):
         """
@@ -915,9 +977,7 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
 
             # add a little random jitter, to randomize results around the same alpha
             jitter = self.random_state.rand(len(self.alpha))
-            if mat.is_cupy(self.alpha):
-                jitter = cp.asarray(jitter)
-            sort_alpha = self.alpha + 0.0001 * jitter
+            sort_alpha = mat.asnumpy(self.alpha) + 0.0001 * jitter
             # random_state.rand returns float64, but converting back to dtype won't speed up anything
 
             sorted_topics = list(mat.argsort(sort_alpha))

@@ -28,6 +28,8 @@ from six.moves import xrange, zip as izip
 
 from gensim.cuda import *
 
+import cupy
+
 logger = logging.getLogger(__name__)
 
 ## Generic numpy/cupy functions
@@ -64,6 +66,10 @@ def max(x, *args, **kwargs):
     xp = get_array_module(x)
     return xp.max(x, *args, **kwargs)
 
+def reciprocal(x, *args, **kwargs):
+    xp = get_array_module(x)
+    return xp.reciprocal(x, *args, **kwargs)
+
 def dot(x, y, *args, **kwargs):
     xp = get_array_module(x)
     assert xp == get_array_module(y)
@@ -73,6 +79,21 @@ def matmul(x, y, *args, **kwargs):
     xp = get_array_module(x)
     assert xp == get_array_module(y)
     return xp.matmul(x, y, *args, **kwargs)
+
+def outer(x, y, *args, **kwargs):
+    xp = get_array_module(x)
+    assert xp == get_array_module(y)
+    return xp.outer(x, y, *args, **kwargs)
+
+def multiply(x, y, *args, **kwargs):
+    xp = get_array_module(x)
+    assert xp == get_array_module(y)
+    return xp.multiply(x, y, *args, **kwargs)
+
+def divide(x, y, *args, **kwargs):
+    xp = get_array_module(x)
+    assert xp == get_array_module(y)
+    return xp.divide(x, y, *args, **kwargs)
 
 def psi(x):
     if is_cupy(x):
@@ -88,7 +109,6 @@ def dirichlet_expectation(alpha):
             result = cupy_digamma(alpha) - cupy_digamma(cp.sum(alpha, 1))[:, cp.newaxis]
         return result.astype(alpha.dtype, copy=False)  # keep the same precision as input
     else:
-        z = _dirichlet_expectation(alpha)
         return _dirichlet_expectation(alpha)
 
 def logsumexp(x):
@@ -106,6 +126,38 @@ def gammaln(x):
     else:
         return scipy.special.gammaln(x)
 
+def spdiv(A, B):
+    """Elementwise division of sparse csr matrix A by dense matrix B"""
+    new_data = cp.zeros_like(A.data)
+    cp.ElementwiseKernel(
+        'raw S indptr, raw S indices, raw T data, raw T div, int32 dim',
+        'raw T new_data',
+        '''
+        for (int j = indptr[i]; j < indptr[i+1]; j++) {
+            int ind[] = {i, indices[j] % dim};
+            new_data[j] = __fdividef(data[j], div[ind]);
+        }
+        ''',
+        'spdiv')(A.indptr, A.indices, A.data, B, A.shape[1],
+                 new_data, size=A.shape[0])
+    return A._with_data(new_data)
+
+
+def spdiv2(A, B):
+    """Elementwise division of sparse csr matrix A by dense matrix B"""
+    new_data = cp.zeros_like(A.data)
+    cp.ElementwiseKernel(
+        'raw S indptr, raw S indices, raw T data, raw T div, int32 dim',
+        'raw T new_data',
+        '''
+        for (int j = indptr[i]; j < indptr[i+1]; j++) {
+            int ind[] = {i, indices[j] % dim};
+            new_data[j] = fdividef(data[j], div[ind]);
+        }
+        ''',
+        'spdiv')(A.indptr, A.indices, A.data, B, A.shape[1],
+                 new_data, size=A.shape[0])
+    return A._with_data(new_data)
 
 def blas(name, ndarray):
     """Helper for getting BLAS function, used :func:`scipy.linalg.get_blas_funcs`.

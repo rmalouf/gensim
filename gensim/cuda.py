@@ -5,6 +5,7 @@
 # Licensed under the GNU LGPL v2.1 - http://www.gnu.org/licenses/lgpl.html
 
 import numpy as np
+from contextlib import contextmanager
 
 try:
     import cupy as cp
@@ -18,13 +19,9 @@ try:
     def asnumpy(x):
         return cp.asnumpy(x)
 
-    cupy_gammaln = cp.ElementwiseKernel(
-        'T x',
-        'T y',
-        '''
-        y = lgammaf(x)
-        ''',
-        'cupy_gammaln')
+    cupy_gammaln = cp.core.create_ufunc(
+        'gammaln', ('e->e', 'f->f', 'd->d'),
+        'out0 = lgamma(in0)')
 
     cupy_digamma = cp.ElementwiseKernel(
         'T x',
@@ -58,7 +55,33 @@ try:
         }
         y = value
         ''',
-        'cupy_digamma')
+        'digamma')
+
+#def atomicAdd(x, y):
+#    """x += y as an atomic operation"""
+
+    #atomicAdd = cp.core.create_ufunc(
+    #    'atomicAdd', ('e->e', 'f->f', 'd->d', 'F->F', 'D->D'),
+    #    'atomicAdd(&oaut0, in0)')
+
+    def atomicAdd(x, y):
+        """x += y as an atomic operation"""
+        cp.ElementwiseKernel(
+            'S in, raw S out',
+            '',
+            '''
+            atomicAdd(&out[i], in);
+            ''',
+            'atomicAdd')(y, x)
+        return x
+
+    @contextmanager
+    def prof_range(label):
+        try:
+            cp.cuda.nvtx.RangePush(label)
+            yield
+        finally:
+            cp.cuda.nvtx.RangePop()
 
 
 except ImportError:
@@ -71,3 +94,7 @@ except ImportError:
 
     def asnumpy(x):
         return x
+
+    @contextmanager
+    def prof_range(label):
+        yield
