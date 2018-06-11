@@ -57,14 +57,7 @@ try:
         ''',
         'digamma')
 
-#def atomicAdd(x, y):
-#    """x += y as an atomic operation"""
-
-    #atomicAdd = cp.core.create_ufunc(
-    #    'atomicAdd', ('e->e', 'f->f', 'd->d', 'F->F', 'D->D'),
-    #    'atomicAdd(&oaut0, in0)')
-
-    def atomicAdd(x, y):
+    def cupy_atomicAdd(x, y):
         """x += y as an atomic operation"""
         cp.ElementwiseKernel(
             'S in, raw S out',

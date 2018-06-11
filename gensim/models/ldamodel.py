@@ -42,6 +42,7 @@ from collections import defaultdict
 import concurrent.futures
 import threading
 import array
+import contextlib
 
 from gensim import interfaces, utils
 import gensim.matutils as mat
@@ -108,8 +109,10 @@ class LdaState(utils.SaveLoad):
         self.eta = eta.astype(dtype, copy=False)
         if cuda:
             self.sstats = cp.zeros(shape, dtype=dtype)
+            self._lock = threading._Lock()
         else:
             self.sstats = np.zeros(shape, dtype=dtype)
+            self._lock = None
         self.numdocs = 0
         self.dtype = dtype
 
@@ -118,8 +121,12 @@ class LdaState(utils.SaveLoad):
         Prepare the state for a new EM iteration (reset sufficient stats).
 
         """
+        if self._lock:
+            self._lock.acquire()
         self.sstats[:] = 0.0
         self.numdocs = 0
+        if self._lock:
+            self._lock.release()
 
     def merge(self, other):
         """
@@ -132,8 +139,12 @@ class LdaState(utils.SaveLoad):
 
         """
         assert other is not None
+        if self._lock:
+            self._lock.acquire()
         self.sstats += other.sstats
         self.numdocs += other.numdocs
+        if self._lock:
+            self._lock.release()
 
     def blend(self, rhot, other, targetsize=None):
         """
@@ -152,6 +163,9 @@ class LdaState(utils.SaveLoad):
         if targetsize is None:
             targetsize = self.numdocs
 
+        if self._lock:
+            self._lock.acquire()
+
         # stretch the current model's expected n*phi counts to target size
         if self.numdocs == 0 or targetsize == self.numdocs:
             scale = 1.0
@@ -169,6 +183,10 @@ class LdaState(utils.SaveLoad):
 
         self.numdocs = targetsize
 
+        if self._lock:
+            self._lock.release()
+
+
     def blend2(self, rhot, other, targetsize=None):
         """
         Alternative, more simple blend.
@@ -178,8 +196,12 @@ class LdaState(utils.SaveLoad):
             targetsize = self.numdocs
 
         # merge the two matrices by summing
+        if self._lock:
+            self._lock.acquire()
         self.sstats += other.sstats
         self.numdocs = targetsize
+        if self._lock:
+            self._lock.release()
 
     def get_lambda(self):
         return self.eta + self.sstats
@@ -530,6 +552,79 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         else:
             return self._cpu_inference(chunk, collect_sstats)
 
+    def _cpu_inference(self, chunk, collect_sstats=False):
+        # Initialize the variational distribution q(theta|gamma) for the chunk
+        gamma = self.random_state.gamma(100., 1. / 100., (len(chunk), self.num_topics)).astype(self.dtype, copy=False)
+        Elogtheta = dirichlet_expectation(gamma)
+        expElogtheta = np.exp(Elogtheta)
+
+        assert Elogtheta.dtype == self.dtype
+        assert expElogtheta.dtype == self.dtype
+
+        if collect_sstats:
+            sstats = np.zeros_like(self.expElogbeta, dtype=self.dtype)
+        else:
+            sstats = None
+        converged = 0
+
+        # Now, for each document d update that document's gamma and phi
+        # Inference code copied from Hoffman's `onlineldavb.py` (esp. the
+        # Lee&Seung trick which speeds things up by an order of magnitude, compared
+        # to Blei's original LDA-C code, cool!).
+        for d, doc in enumerate(chunk):
+            if len(doc) > 0 and not isinstance(doc[0][0], six.integer_types + (np.integer,)):
+                # make sure the term IDs are ints, otherwise np will get upset
+                ids = [int(idx) for idx, _ in doc]
+            else:
+                ids = [idx for idx, _ in doc]
+            cts = np.array([cnt for _, cnt in doc], dtype=self.dtype)
+            gammad = gamma[d, :]
+            Elogthetad = Elogtheta[d, :]
+            expElogthetad = expElogtheta[d, :]
+            expElogbetad = self.expElogbeta[:, ids]
+
+            # The optimal phi_{dwk} is proportional to expElogthetad_k * expElogbetad_w.
+            # phinorm is the normalizer.
+            # TODO treat zeros explicitly, instead of adding epsilon?
+            eps = DTYPE_TO_EPS[self.dtype]
+            phinorm = np.dot(expElogthetad, expElogbetad) + eps
+
+            # Iterate between gamma and phi until convergence
+            for k in xrange(self.iterations):
+                lastgamma = gammad
+                # We represent phi implicitly to save memory and time.
+                # Substituting the value of the optimal phi back into
+                # the update for gamma gives this update. Cf. Lee&Seung 2001.
+                gammad = self.alpha + expElogthetad * np.dot(cts / phinorm, expElogbetad.T)
+                Elogthetad = dirichlet_expectation(gammad)
+                expElogthetad = np.exp(Elogthetad)
+                phinorm = np.dot(expElogthetad, expElogbetad) + eps
+                # If gamma hasn't changed much, we're done.
+                meanchange = mean_absolute_difference(gammad, lastgamma)
+                if meanchange < self.gamma_threshold:
+                    converged += 1
+                    break
+            gamma[d, :] = gammad
+            assert gammad.dtype == self.dtype
+            if collect_sstats:
+                # Contribution of document d to the expected sufficient
+                # statistics for the M step.
+                sstats[:, ids] += np.outer(expElogthetad.T, cts / phinorm)
+
+        if len(chunk) > 1:
+            logger.debug("%i/%i documents converged within %i iterations", converged, len(chunk), self.iterations)
+
+        if collect_sstats:
+            # This step finishes computing the sufficient statistics for the
+            # M step, so that
+            # sstats[k, w] = \sum_d n_{dw} * phi_{dwk}
+            # = \sum_d n_{dw} * exp{Elogtheta_{dk} + Elogbeta_{kw}} / phinorm_{dw}.
+            sstats *= self.expElogbeta
+            assert sstats.dtype == self.dtype
+
+        assert gamma.dtype == self.dtype
+        return gamma, sstats
+
     def _gpu_inference(self, chunk, collect_sstats=False):
         with mat.prof_range('prepare'):
             gamma = self.random_state.gamma(100., 1. / 100., (len(chunk), self.num_topics)).astype(self.dtype, copy=False)
@@ -614,11 +709,15 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
         with mat.prof_range('estep'):
             if state is None:
                 state = self.state
-            stream = cp.cuda.stream.Stream()
-            with stream:
-                gamma, sstats = self.inference(chunk, collect_sstats=True)
-                #state.sstats += sstats
-                state.sstats = mat.atomicAdd(state.sstats, sstats)
+            if self.cuda:
+                stream = cp.cuda.stream.Stream()
+                stream.use()
+            gamma, sstats = self.inference(chunk, collect_sstats=True)
+            #state.sstats += sstats
+            state.sstats = mat.atomicAdd(state.sstats, sstats)
+            if self.cuda:
+                stream = cp.cuda.stream.Stream()
+                cp.cuda.Stream.null.use()
             state.numdocs += gamma.shape[0]  # avoids calling len(chunk) on a generator
             assert gamma.dtype == self.dtype
         return gamma
@@ -779,7 +878,6 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
             # initialize metrics list to store metric values after every epoch
             self.metrics = defaultdict(list)
 
-        self.lock = threading.Lock()
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=15)
 
         for pass_ in xrange(passes):
@@ -830,11 +928,13 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
 
                     for job in concurrent.futures.as_completed(jobs):
                         job.result()
+                    jobs = [ ]
                     cp.cuda.Stream.null.synchronize()
 
                     self.do_mstep(rho(), other, pass_ > 0)
+                    cp.cuda.Stream.null.synchronize()
+
                     del other  # frees up memory
-                    jobs = [ ]
                     if self.dispatcher:
                         logger.info('initializing workers')
                         self.dispatcher.reset(self.state)
@@ -858,9 +958,9 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                     # distributed mode: wait for all workers to finish
                     logger.info("reached the end of input; now waiting for all remaining jobs to finish")
                     other = self.dispatcher.getstate()
-                concurrent.futures.wait(jobs)
+                for job in concurrent.futures.as_completed(jobs):
+                    job.result()
                 cp.cuda.Stream.null.synchronize()
-
 
                 self.do_mstep(rho(), other, pass_ > 0)
                 del other

@@ -88,8 +88,7 @@ class LdaMulticore(LdaModel):
                  chunksize=2000, passes=1, batch=False, alpha='symmetric',
                  eta=None, decay=0.5, offset=1.0, eval_every=10, iterations=50,
                  gamma_threshold=0.001, random_state=None, minimum_probability=0.01,
-                 minimum_phi_value=0.01, per_word_topics=False, dtype=np.float32,
-                 cuda=False):
+                 minimum_phi_value=0.01, per_word_topics=False, dtype=np.float32):
         """
         If given, start training from the iterable `corpus` straight away. If not given,
         the model is left untrained (presumably because you want to call `update()` manually).
@@ -155,7 +154,7 @@ class LdaMulticore(LdaModel):
             id2word=id2word, chunksize=chunksize, passes=passes, alpha=alpha, eta=eta,
             decay=decay, offset=offset, eval_every=eval_every, iterations=iterations,
             gamma_threshold=gamma_threshold, random_state=random_state, minimum_probability=minimum_probability,
-            minimum_phi_value=minimum_phi_value, per_word_topics=per_word_topics, dtype=dtype, cuda=cuda
+            minimum_phi_value=minimum_phi_value, per_word_topics=per_word_topics, dtype=dtype
         )
 
     def update(self, corpus, chunks_as_numpy=False):
@@ -223,7 +222,7 @@ class LdaMulticore(LdaModel):
         pool = Pool(self.workers, worker_e_step, (job_queue, result_queue,))
         for pass_ in xrange(self.passes):
             queue_size, reallen = [0], 0
-            other = LdaState(self.eta, self.state.sstats.shape, cuda=self.cuda)
+            other = LdaState(self.eta, self.state.sstats.shape)
 
             def process_result_queue(force=False):
                 """

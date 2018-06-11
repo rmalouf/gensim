@@ -120,6 +120,13 @@ def logsumexp(x):
     else:
         return _logsumexp(x)
 
+def atomicAdd(x, y):
+    if is_cupy(x):
+        cupy_atomicAdd(y, x)
+    else:
+        x += y
+    return x
+
 def gammaln(x):
     if is_cupy(x):
         return cupy_gammaln(x)
