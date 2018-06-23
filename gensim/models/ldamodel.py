@@ -109,7 +109,7 @@ class LdaState(utils.SaveLoad):
         self.eta = eta.astype(dtype, copy=False)
         if cuda:
             self.sstats = cp.zeros(shape, dtype=dtype)
-            self._lock = threading._Lock()
+            self._lock = threading.Lock()
         else:
             self.sstats = np.zeros(shape, dtype=dtype)
             self._lock = None
@@ -925,6 +925,7 @@ class LdaModel(interfaces.TransformationABC, basemodel.BaseTopicModel):
                         # distributed mode: wait for all workers to finish
                         logger.info("reached the end of input; now waiting for all remaining jobs to finish")
                         other = self.dispatcher.getstate()
+
 
                     for job in concurrent.futures.as_completed(jobs):
                         job.result()

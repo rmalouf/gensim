@@ -121,8 +121,9 @@ def logsumexp(x):
         return _logsumexp(x)
 
 def atomicAdd(x, y):
+    """x += y as an atomic operation"""
     if is_cupy(x):
-        cupy_atomicAdd(y, x)
+        x = cupy_atomicAdd(y, x)
     else:
         x += y
     return x
